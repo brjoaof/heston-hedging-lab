@@ -1,0 +1,132 @@
+{
+  "simulation": {
+    "measure": "Q",
+    "spot0": 100.0,
+    "risk_free_rate": 0.1,
+    "dividend_yield": 0.0,
+    "physical_total_return": null,
+    "trading_days_per_year": 252,
+    "n_steps": 126,
+    "n_paths": 1000,
+    "seed": 123
+  },
+  "heston": {
+    "kappa": 2.0,
+    "theta": 0.04,
+    "xi": 0.4,
+    "rho": -0.7,
+    "v0": 0.04
+  },
+  "books": {
+    "n_books": 16,
+    "sizes": [
+      1,
+      3,
+      5,
+      9
+    ],
+    "expiries_days": [
+      21,
+      42,
+      63,
+      84,
+      126
+    ],
+    "strike_moneyness_range": [
+      0.85,
+      1.15
+    ],
+    "max_abs_quantity": 3,
+    "seed": 124
+  },
+  "volatility_surface": {
+    "maturities_days": [
+      21,
+      42,
+      63,
+      84,
+      126,
+      189,
+      252
+    ],
+    "log_moneyness": [
+      -0.1,
+      -0.075,
+      -0.05,
+      -0.025,
+      0.0,
+      0.025,
+      0.05,
+      0.075,
+      0.1
+    ],
+    "variance_nodes": [
+      0.0,
+      0.002,
+      0.005,
+      0.01,
+      0.02,
+      0.03,
+      0.04,
+      0.055,
+      0.075,
+      0.1,
+      0.13,
+      0.17,
+      0.22,
+      0.29,
+      0.38,
+      0.48,
+      0.6
+    ]
+  },
+  "hedging": {
+    "n_paths": 64,
+    "n_books": 4,
+    "seed": 321,
+    "physical_total_return": 0.1,
+    "physical_heston": {
+      "kappa": 2.0,
+      "theta": 0.04,
+      "xi": 0.4,
+      "rho": -0.7,
+      "v0": 0.04
+    },
+    "proportional_cost": 0.001,
+    "fixed_cost": 0.5,
+    "band_width": 0.5,
+    "rebalance_every": 21,
+    "min_trade": 0.01
+  },
+  "forward_experiment": {
+    "description": "Q-Heston pilot; fixed_eniac_book() and three forward-style hedge buckets",
+    "measure": "Q",
+    "spot0": 100.0,
+    "risk_free_rate": 0.09531017980432493,
+    "dividend_yield": 0.0,
+    "trading_days_per_year": 250,
+    "n_steps": 126,
+    "seed": 123,
+    "heston": {
+      "kappa": 1.0,
+      "theta": 0.2,
+      "xi": 0.2,
+      "rho": 0.7,
+      "v0": 0.04
+    },
+    "expiries_days": [
+      42,
+      84,
+      126
+    ],
+    "spread_half_pcts": [
+      0.01,
+      0.02,
+      0.03
+    ],
+    "fixed_cost": 0.5,
+    "min_trade": 0.01,
+    "max_trade_increment": 1.0,
+    "max_position": 3.0
+  }
+}

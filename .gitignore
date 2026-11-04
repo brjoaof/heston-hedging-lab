@@ -1,0 +1,23 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Generated simulations, datasets, and training artifacts
+results/
+data/
+datasets/
+checkpoints/
+artifacts/
+*.log
+*.zip
+*.patch
+
+# Local environment files
+.env
+.env.*
+.DS_Store
