@@ -1,0 +1,19 @@
+# Keep source files consistent when cloning on the server.
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Never line-ending-transform binary experiment artifacts.
+*.zip binary
+*.npz binary
+*.npy binary
+*.pkl binary
+*.pt binary
+*.pth binary
+*.ckpt binary

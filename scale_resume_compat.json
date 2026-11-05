@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "reason": "fresh_episode_resume_after_vecenv_reset",
+  "compatible_previous_sha256": [
+    "75ca78ee958d4f3326867c7cc59de1c87422dc6f267768c06e48bd0b25c8ce58",
+    "ba32bff3d9ed80a47cb4afa7540c7811ead9a5ab0881262a3e9bd4ff358f89e8",
+    "591306c9ac8709eb976f97c5d1b42fceddf87c1e01c8c45546e477de5e17f83f"
+  ],
+  "fixed_code_sha256": "5433ba2841c4d8eb4b8bbddb1118353c12209ed85e135cd7fb395a24b8a010c9"
+}
