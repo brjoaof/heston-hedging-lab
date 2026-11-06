@@ -22,11 +22,15 @@ class BookPaths:
     gamma: np.ndarray
     variance_sensitivity: np.ndarray
     settlements: np.ndarray
+    contract_prices: np.ndarray | None = None  # optional unsigned mid marks (paths, times, contracts)
+    bucket_delta: np.ndarray | None = None  # signed option delta by increasing maturity (paths, times, maturities)
 
 
 def value_book_paths(
     book: OptionBook, paths: HestonPaths, params_q: HestonParams,
     market_q: MarketDynamics, *, trading_days_per_year: int = 252,
+    include_contract_prices: bool = False,
+    include_bucket_deltas: bool = False,
 ) -> BookPaths:
     """Revalue each *live* option on physical or Q paths, always using Q prices.
 
@@ -40,7 +44,13 @@ def value_book_paths(
     values = [np.zeros_like(paths.spot) for _ in range(4)]
     settlements = expiry_cashflows(book, paths.spot)
     n_days = paths.spot.shape[1]
-    for contract in book.contracts:
+    contract_prices = (np.zeros((*paths.spot.shape, book.n_contracts), dtype=float)
+                       if include_contract_prices else None)
+    maturities = tuple(sorted({c.maturity_days for c in book.contracts}))
+    bucket_delta = (np.zeros((*paths.spot.shape, len(maturities)), dtype=float)
+                    if include_bucket_deltas else None)
+    maturity_index = {m: i for i, m in enumerate(maturities)}
+    for contract_index, contract in enumerate(book.contracts):
         if contract.maturity_days >= n_days:
             raise ValueError("Option matures after the simulated horizon")
         amount = contract.quantity * contract.multiplier
@@ -51,9 +61,13 @@ def value_book_paths(
                 spots=paths.spot[:, day], variances=paths.variance[:, day],
                 option_type=contract.option_type,
             )
+            if contract_prices is not None:
+                contract_prices[:, day, contract_index] = greeks.price
+            if bucket_delta is not None:
+                bucket_delta[:, day, maturity_index[contract.maturity_days]] += amount * greeks.delta
             for target, field in zip(values, ("price", "delta", "gamma", "variance_sensitivity")):
                 target[:, day] += amount * getattr(greeks, field)
-    return BookPaths(*values, settlements)
+    return BookPaths(*values, settlements, contract_prices, bucket_delta)
 
 
 @dataclass(frozen=True)
@@ -273,6 +287,121 @@ def execute_forward_trades(
     return new_position, executed_change, spread_paid, fixed_paid
 
 
+
+@dataclass(frozen=True)
+class ForwardStep:
+    """The cash/position transition for one interval, shared by RL and batch evaluation."""
+    position: np.ndarray            # after mandatory close at day+1
+    cash: np.ndarray                # financed cash after settlements and closes
+    hedge_pnl: np.ndarray
+    executed_change: np.ndarray    # requested trades executed at day
+    forced_close: np.ndarray       # positive quantity liquidated at day+1
+    spread_cost: np.ndarray        # regular + forced closure
+    fixed_cost: np.ndarray
+    trade_count: np.ndarray
+    turnover: np.ndarray
+
+
+def forward_initial_cash(
+    option_value0: np.ndarray, initial_positions: np.ndarray,
+    spot0: np.ndarray, market_q: MarketDynamics, *,
+    expiries_days: tuple[int, ...] = (42, 84, 126),
+    spread_half_pcts: tuple[float, ...] = (0.01, 0.02, 0.03),
+    fixed_cost: float = 0.5,
+    trading_days_per_year: int = 250,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Short-book premium finances cash; pay opening costs at time zero."""
+    if market_q.measure != "Q":
+        raise ValueError("Forward hedge requires Q market")
+    position = np.asarray(initial_positions, dtype=float)
+    spot = np.asarray(spot0, dtype=float)
+    option_value = np.asarray(option_value0, dtype=float)
+    if position.ndim != 2 or spot.shape != (len(position),) or option_value.shape != spot.shape:
+        raise ValueError("invalid initial cash inputs shape")
+    if not np.all(np.isfinite(position)) or not np.all(np.isfinite(option_value)):
+        raise ValueError("initial positions and book values must be finite")
+    spread = np.asarray(spread_half_pcts, dtype=float)
+    if spread.shape != (position.shape[1],) or not np.all(np.isfinite(spread)) or np.any(spread < 0):
+        raise ValueError("invalid spreads")
+    if not math.isfinite(fixed_cost) or fixed_cost < 0:
+        raise ValueError("invalid fixed_cost")
+    f0 = forward_prices(spot, 0, expiries_days, market_q.risk_free_rate,
+                        dividend_yield=market_q.dividend_yield,
+                        trading_days_per_year=trading_days_per_year)
+    spread_open = np.sum(spread[None, :] * f0 * np.abs(position), axis=1)
+    fixed_open = fixed_cost * np.count_nonzero(position, axis=1)
+    opening_cost = spread_open + fixed_open
+    return -option_value - opening_cost, opening_cost, spread_open, fixed_open
+
+
+def advance_forward_hedge(
+    position: np.ndarray, cash: np.ndarray,
+    spot_now: np.ndarray, spot_next: np.ndarray,
+    settlement_next: np.ndarray, action: np.ndarray,
+    market_q: MarketDynamics, *, day: int,
+    expiries_days: tuple[int, ...] = (42, 84, 126),
+    spread_half_pcts: tuple[float, ...] = (0.01, 0.02, 0.03),
+    fixed_cost: float = 0.5, min_trade: float = 0.01,
+    max_trade_increment: float = 1.0, max_position: float = 3.0,
+    trading_days_per_year: int = 250,
+) -> ForwardStep:
+    """Pure, causal transition: trade at t, hold to t+1, settle/close at t+1.
+
+    Uses the ENIAC simplified daily forward-price-difference convention, not
+    a complete OTC forward contract settlement model. All inputs are batches.
+    """
+    if market_q.measure != "Q":
+        raise ValueError("Forward hedge requires Q market")
+    pos = np.asarray(position, dtype=float)
+    cash = np.asarray(cash, dtype=float)
+    sn = np.asarray(spot_now, dtype=float)
+    sx = np.asarray(spot_next, dtype=float)
+    settle = np.asarray(settlement_next, dtype=float)
+    if pos.ndim != 2 or any(v.shape != (len(pos),) for v in (cash, sn, sx, settle)):
+        raise ValueError("invalid state or cashflow shapes")
+    if not (np.all(np.isfinite(cash)) and np.all(np.isfinite(settle))):
+        raise ValueError("cash and settlement must be finite")
+    if day < 0:
+        raise ValueError("day must be nonnegative")
+    forward_now = forward_prices(
+        sn, day, expiries_days, market_q.risk_free_rate,
+        dividend_yield=market_q.dividend_yield,
+        trading_days_per_year=trading_days_per_year,
+    )
+    forward_next = forward_prices(
+        sx, day + 1, expiries_days, market_q.risk_free_rate,
+        dividend_yield=market_q.dividend_yield,
+        trading_days_per_year=trading_days_per_year,
+    )
+    active = np.asarray(expiries_days) > day
+    new_pos, executed, spread, fixed = execute_forward_trades(
+        pos, action, forward_now, active, spread_half_pcts=spread_half_pcts,
+        fixed_cost=fixed_cost, min_trade=min_trade,
+        max_trade_increment=max_trade_increment, max_position=max_position,
+    )
+    pnl = np.sum(new_pos * (forward_next - forward_now), axis=1)
+    growth = math.exp(market_q.risk_free_rate / trading_days_per_year)
+    new_cash = (cash - spread - fixed) * growth + pnl + settle
+    trade_count = np.count_nonzero(executed, axis=1)
+    turnover = np.sum(np.abs(executed), axis=1)
+    forced_close = np.zeros_like(new_pos)
+    expiring = np.asarray(expiries_days) == day + 1
+    if np.any(expiring):
+        forced_close[:, expiring] = new_pos[:, expiring]
+        spread_close = np.sum(
+            np.asarray(spread_half_pcts)[None, expiring]
+            * sx[:, None] * np.abs(forced_close[:, expiring]), axis=1,
+        )
+        fixed_close = fixed_cost * np.count_nonzero(forced_close, axis=1)
+        new_cash -= spread_close + fixed_close
+        spread += spread_close
+        fixed += fixed_close
+        trade_count += np.count_nonzero(forced_close, axis=1)
+        turnover += np.sum(np.abs(forced_close), axis=1)
+        new_pos[:, expiring] = 0.0
+    return ForwardStep(new_pos, new_cash, pnl, executed, forced_close,
+                       spread, fixed, trade_count, turnover)
+
 def simulate_forward_hedge(
     paths: HestonPaths, book_paths: BookPaths, market_q: MarketDynamics, *,
     initial_positions: np.ndarray, actions: np.ndarray,
@@ -335,55 +464,28 @@ def simulate_forward_hedge(
     hedge_pnl = np.zeros((n_paths, n_steps), dtype=float)
     trades = np.count_nonzero(position, axis=1)
     turnover = np.sum(np.abs(position), axis=1)
-    f0 = forward_prices(spot[:, 0], 0, expiries_days, market_q.risk_free_rate,
-                        dividend_yield=market_q.dividend_yield,
-                        trading_days_per_year=trading_days_per_year)
-    spread_total = np.sum(np.asarray(spread_half_pcts)[None, :] * f0 * np.abs(position), axis=1)
-    fixed_total = fixed_cost * np.count_nonzero(position, axis=1)
-    initial_cost = spread_total + fixed_total
-    cash = -book_paths.value[:, 0] - initial_cost
+    cash, initial_cost, spread_total, fixed_total = forward_initial_cash(
+        book_paths.value[:, 0], position, spot[:, 0], market_q,
+        expiries_days=expiries_days, spread_half_pcts=spread_half_pcts,
+        fixed_cost=fixed_cost, trading_days_per_year=trading_days_per_year,
+    )
     wealth[:, 0] = cash + book_paths.value[:, 0]
-    growth = math.exp(market_q.risk_free_rate / trading_days_per_year)
-
     for day in range(n_steps):
-        active = np.asarray(expiries_days) > day
-        f_prev = forward_prices(spot[:, day], day, expiries_days,
-                                market_q.risk_free_rate,
-                                dividend_yield=market_q.dividend_yield,
-                                trading_days_per_year=trading_days_per_year)
-        new_position, change, spread, fixed = execute_forward_trades(
-            position, actions[:, day, :], f_prev, active,
+        step = advance_forward_hedge(
+            position, cash, spot[:, day], spot[:, day + 1],
+            book_paths.settlements[:, day + 1], actions[:, day, :],
+            market_q, day=day, expiries_days=expiries_days,
             spread_half_pcts=spread_half_pcts, fixed_cost=fixed_cost,
             min_trade=min_trade, max_trade_increment=max_trade_increment,
             max_position=max_position,
+            trading_days_per_year=trading_days_per_year,
         )
-        spread_total += spread
-        fixed_total += fixed
-        trades += np.count_nonzero(change, axis=1)
-        turnover += np.sum(np.abs(change), axis=1)
-        f_next = forward_prices(spot[:, day + 1], day + 1, expiries_days,
-                                market_q.risk_free_rate,
-                                dividend_yield=market_q.dividend_yield,
-                                trading_days_per_year=trading_days_per_year)
-        hedge_pnl[:, day] = np.sum(new_position * (f_next - f_prev), axis=1)
-        # Trades occur at t; their costs are funded over [t, t+1].
-        cash = (cash - spread - fixed) * growth + hedge_pnl[:, day]
-        cash += book_paths.settlements[:, day + 1]
-        expiring = np.asarray(expiries_days) == day + 1
-        if np.any(expiring):
-            q_close = new_position[:, expiring]
-            forced_spread = np.sum(
-                np.asarray(spread_half_pcts)[None, expiring]
-                * spot[:, day + 1, None] * np.abs(q_close), axis=1
-            )
-            forced_fixed = fixed_cost * np.count_nonzero(q_close, axis=1)
-            spread_total += forced_spread
-            fixed_total += forced_fixed
-            trades += np.count_nonzero(q_close, axis=1)
-            turnover += np.sum(np.abs(q_close), axis=1)
-            cash -= forced_spread + forced_fixed
-            new_position[:, expiring] = 0.0
-        position = new_position
+        position, cash = step.position, step.cash
+        spread_total += step.spread_cost
+        fixed_total += step.fixed_cost
+        trades += step.trade_count
+        turnover += step.turnover
+        hedge_pnl[:, day] = step.hedge_pnl
         stored_positions[:, day + 1] = position
         wealth[:, day + 1] = cash + book_paths.value[:, day + 1]
     return ForwardHedgeResults(

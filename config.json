@@ -127,6 +127,8 @@
     "fixed_cost": 0.5,
     "min_trade": 0.01,
     "max_trade_increment": 1.0,
-    "max_position": 3.0
+    "max_position": 3.0,
+    "quadratic_reward_penalty": 0.0,
+    "include_variance": true
   }
 }
