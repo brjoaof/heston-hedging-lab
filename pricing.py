@@ -218,6 +218,111 @@ def _legendre_nodes(n: int):
     return leggauss(n)
 
 
+
+def _adaptive_heston_greeks_near_boundary(
+    params: HestonParams, market: MarketDynamics, *,
+    spot: float, variance: float, strike: float, maturity: float,
+) -> OptionGreeks:
+    """Carr-Madan damped Fourier inversion for rare unstable boundary states.
+
+    The standard P1/P2 inversion subtracts two nearly equal large numbers and
+    is unreliable for near-zero variance at one-day expiry. This formula
+    integrates the out-of-the-money call *directly*, including analytical
+    Delta, Gamma and dPrice/dv. QUADPACK's oscillatory integration handles
+    the high-frequency short-maturity phase without distorting the Heston
+    dynamics or silently replacing the price with intrinsic value.
+
+    This is intentionally a rare-state fallback, not the main path pricer.
+    """
+    import warnings
+    from scipy.integrate import IntegrationWarning, quad
+
+    r, q = market.risk_free_rate, market.dividend_yield
+    kappa, theta, xi, rho = params.kappa, params.theta, params.xi, params.rho
+    if xi <= 0:
+        raise ValueError("Adaptive Fourier fallback requires xi>0")
+    # C = S exp(-qT) exp(-alpha*k)/pi * integral[...],
+    # k = log(K/F), alpha>0, F=S exp((r-q)T).
+    alpha = 1.0
+    log_moneyness = math.log(strike/spot) - (r-q)*maturity
+    amplitude = math.exp(-alpha*log_moneyness) / math.pi
+    discount_s = math.exp(-q*maturity)
+
+    def terms(u: float) -> tuple[complex, complex, complex, complex]:
+        z = complex(u, -(alpha + 1.0))
+        iz = 1j*z
+        b = kappa - rho*xi*iz
+        d = np.sqrt(b*b + xi*xi*(z*z+iz))
+        bmd = -xi*xi*(z*z+iz)/(b+d)
+        g = bmd/(b+d)
+        e = np.exp(-d*maturity)
+        c = (kappa*theta/(xi*xi))*(
+            bmd*maturity - 2*(np.log1p(-g*e)-np.log1p(-g))
+        )
+        D = (bmd/(xi*xi))*(1-e)/(1-g*e)
+        cf = np.exp(c + D*variance)
+        denominator = alpha + 1j*u
+        return (cf/(denominator*(denominator+1)),
+                cf/denominator, cf, cf*D/(denominator*(denominator+1)))
+
+    # At v=0 and short T the characteristic function decays only at very
+    # high frequencies. Instead of integrating to infinity (which can produce
+    # a convincing but wrong answer when k≈0), truncate at an explicit point
+    # where the *damped* characteristic function is numerically negligible.
+    cutoff = 100.0
+    for _ in range(25):
+        if abs(terms(cutoff)[2]) < 1e-12:
+            break
+        cutoff *= 2
+    else:
+        raise FloatingPointError("Could not bound Heston Fourier integration tail")
+
+    integrals = []
+    for field in range(4):
+        value = 0.0
+        for imaginary in (False, True):
+            if imaginary and abs(log_moneyness) < 1e-15:
+                continue
+
+            def component(u: float) -> float:
+                entry = terms(u)[field]
+                return float(entry.imag if imaginary else entry.real)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", IntegrationWarning)
+                # QUADPACK's finite-interval oscillatory rule remains stable
+                # when |k| is small, unlike its infinite-cycle counterpart.
+                integral, _ = quad(
+                    component, 0, cutoff,
+                    weight="sin" if imaginary else "cos",
+                    wvar=log_moneyness, epsabs=1e-10, epsrel=1e-10,
+                    limit=700,
+                )
+            value += integral
+        integrals.append(value * amplitude)
+
+    call = spot * discount_s * integrals[0]
+    delta = discount_s * integrals[1]
+    gamma = discount_s / spot * integrals[2]
+    dvar = spot * discount_s * integrals[3]
+    lower = max(spot*discount_s - strike*math.exp(-r*maturity), 0.0)
+    upper = spot*discount_s
+    # Absolute tolerance is well below one cent per 100-unit underlying.
+    # Any larger violation indicates a genuine numerical failure.
+    if (not all(math.isfinite(x) for x in (call, delta, gamma, dvar)) or
+            call < lower-1e-7 or call > upper+1e-7 or
+            delta < -1e-7 or delta > discount_s+1e-7 or gamma < -1e-7):
+        raise FloatingPointError(
+            f"Adaptive Heston Fourier unstable at S={spot:.8g}, v={variance:.8g}, "
+            f"K={strike:.8g}, T={maturity:.8g}; "
+            f"price={call:.9g} gamma={gamma:.9g} delta={delta:.9g}"
+        )
+    return OptionGreeks(
+        price=max(call, lower), delta=max(0., min(delta, discount_s)),
+        gamma=max(gamma, 0.), variance_sensitivity=dvar,
+        initial_volatility_vega=2*math.sqrt(variance)*dvar,
+    )
+
 def heston_greeks_batch(
     params: HestonParams, market: MarketDynamics, *,
     strike: float, maturity: float, spots: np.ndarray, variances: np.ndarray,
@@ -339,11 +444,21 @@ def heston_greeks_batch(
             )
             if np.any(invalid):
                 if n_quadrature >= 2048:
-                    jj = int(np.flatnonzero(invalid)[0])
-                    raise FloatingPointError(
-                        f"Heston Fourier unstable at S={float(s[jj,0]):.8g}, v={float(v[jj,0]):.8g}, K={strike:.8g}, T={maturity:.8g}; "
-                        f"price={float(prices[start+jj]):.9g} gamma={float(gammas[start+jj]):.9g} delta={float(deltas[start+jj]):.9g}"
-                    )
+                    # An additional Gauss-Legendre refinement may still alias
+                    # the near-deterministic, highly oscillatory Fourier tail.
+                    # Fall back only for states that violate numerical bounds.
+                    for jj in np.flatnonzero(invalid):
+                        pos = start + int(jj)
+                        accurate = _adaptive_heston_greeks_near_boundary(
+                            params, market, spot=float(ss[pos]),
+                            variance=float(vv[pos]), strike=strike,
+                            maturity=maturity,
+                        )
+                        prices[pos] = accurate.price
+                        deltas[pos] = accurate.delta
+                        gammas[pos] = accurate.gamma
+                        dvars[pos] = accurate.variance_sensitivity
+                    continue
                 # Re-evaluate only numerically challenging states at higher
                 # resolution, not all path/date pairs.
                 idx = np.flatnonzero(invalid) + start
@@ -358,6 +473,17 @@ def heston_greeks_batch(
                 dvars[idx] = refined.variance_sensitivity
             if np.any(~np.isfinite(prices[start:stop])) or np.any(~np.isfinite(deltas[start:stop])):
                 raise FloatingPointError("Unstable Heston path valuation")
+    # Full-truncation Euler can produce exactly zero effective variance.
+    # Near expiration, the standard P1/P2 representation may be inaccurate
+    # without violating its coarse bounds (e.g. a small, spurious OTM delta).
+    if params.xi > 0 and maturity <= 2/250 + 1e-12:
+        for i in np.flatnonzero(vv <= 1e-4):
+            accurate = _adaptive_heston_greeks_near_boundary(
+                params, market, spot=float(ss[i]), variance=float(vv[i]),
+                strike=strike, maturity=maturity,
+            )
+            prices[i], deltas[i] = accurate.price, accurate.delta
+            gammas[i], dvars[i] = accurate.gamma, accurate.variance_sensitivity
     gammas = np.maximum(gammas, 0)  # convexity; tiny negative Fourier noise
     if option_type == "put":
         prices -= ss * stock_discount - strike * strike_discount
@@ -489,8 +615,21 @@ def heston_greeks_strikes_batch(
             (delta[start:stop] > discount_s+1e-3) |
             (gamma[start:stop] < -1e-3)
         )
+        # Even finite (and hence not flagged) short-expiry P1/P2 estimates
+        # can contain spurious OTM prices/deltas near zero variance.
+        boundary = ((vv[start:stop] <= 1e-4) &
+                    (maturity <= 2/250 + 1e-12))
         for j in range(n_strikes):
-            indices = np.flatnonzero(bad[:,j])+start
+            for local_i in np.flatnonzero(boundary):
+                pos = start+int(local_i)
+                accurate = _adaptive_heston_greeks_near_boundary(
+                    params, market, spot=float(ss[pos]),
+                    variance=float(vv[pos]), strike=float(ks[j]),
+                    maturity=maturity,
+                )
+                price[pos,j], delta[pos,j] = accurate.price, accurate.delta
+                gamma[pos,j], dvar[pos,j] = accurate.gamma, accurate.variance_sensitivity
+            indices = np.flatnonzero(bad[:,j] & ~boundary)+start
             if not len(indices):
                 continue
             refined = heston_greeks_batch(
