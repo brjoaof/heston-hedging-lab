@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from heston import HestonParams, MarketDynamics, simulate_heston
-from pricing import heston_greeks_batch, heston_greeks_strikes_batch
+from pricing import (heston_greeks_batch, heston_greeks_strikes_batch,
+                     _adaptive_heston_greeks_near_boundary)
 from portfolio import fixed_eniac_book
 from hedging import value_book_paths
 
@@ -83,3 +84,82 @@ def test_path_valuation_with_high_xi_and_zero_variance(market):
               marks.variance_sensitivity, marks.contract_prices, marks.bucket_delta):
         assert np.all(np.isfinite(x))
     assert np.all(marks.contract_prices >= 0)
+
+
+@pytest.mark.parametrize("xi", [0.25, 0.40])
+def test_itm_short_expiry_small_variance_uses_otm_put_parity(xi, market):
+    """A too-large oscillatory cutoff previously halved the ITM call value.
+
+    The xi=.40 case used to return price=5.142131 while its exact
+    no-arbitrage lower bound was approximately 10.284262.
+    """
+    params = HestonParams(1.0, 0.04, xi, 0.7, 0.04)
+    spot, strike, maturity, variance = 106.24767, 96.0, 1 / 250, 0.0001084851
+    call = heston_greeks_batch(
+        params, market, strike=strike, maturity=maturity,
+        spots=np.array([spot]), variances=np.array([variance]),
+    )
+    put = heston_greeks_batch(
+        params, market, strike=strike, maturity=maturity,
+        spots=np.array([spot]), variances=np.array([variance]),
+        option_type="put",
+    )
+    parity = spot - strike * math.exp(-market.risk_free_rate * maturity)
+    assert call.price[0] >= parity - 1e-7
+    assert call.price[0] == pytest.approx(parity, abs=1e-7)
+    assert call.delta[0] == pytest.approx(1.0, abs=1e-7)
+    assert call.gamma[0] >= 0.0
+    assert put.price[0] >= 0.0
+    assert call.price[0] - put.price[0] == pytest.approx(parity, abs=1e-8)
+    assert call.delta[0] - put.delta[0] == pytest.approx(1.0, abs=1e-8)
+    assert call.gamma[0] == pytest.approx(put.gamma[0], abs=1e-8)
+    assert np.isfinite(call.variance_sensitivity[0])
+
+
+@pytest.mark.parametrize("xi", [0.25, 0.40])
+def test_itm_multistrike_near_boundary_is_arbitrage_consistent(xi, market):
+    params = HestonParams(1.0, 0.04, xi, 0.7, 0.04)
+    spot, variance, maturity = 106.24767, 0.0001084851, 1 / 250
+    strikes = np.array([96.0, 100.0, 104.0])
+    result = heston_greeks_strikes_batch(
+        params, market, strikes=strikes, maturity=maturity,
+        spots=np.array([spot]), variances=np.array([variance]),
+    )
+    lower = np.maximum(spot - strikes * math.exp(-market.risk_free_rate * maturity), 0.0)
+    assert np.all(result.price[0] >= lower - 1e-7)
+    assert np.all(result.delta[0] >= -1e-7)
+    assert np.all(result.delta[0] <= 1.0 + 1e-7)
+    assert np.all(result.gamma[0] >= 0.0)
+    assert np.all(np.isfinite(result.variance_sensitivity))
+    assert result.price[0, 0] == pytest.approx(lower[0], abs=1e-7)
+
+
+def test_strike_batch_high_order_removes_hidden_aliasing_at_small_variance(market):
+    """The 192-node result can be within bounds yet have a wrong price."""
+    params = HestonParams(1.0, 0.04, 0.4, 0.7, 0.04)
+    spots = np.array([94.0, 100.0, 106.0])
+    strikes = np.array([96.0, 100.0, 104.0])
+    result = heston_greeks_strikes_batch(
+        params, market, strikes=strikes, maturity=1/250,
+        spots=spots, variances=np.full(len(spots), 0.001),
+    )
+    for i, spot in enumerate(spots):
+        for j, strike in enumerate(strikes):
+            ref = _adaptive_heston_greeks_near_boundary(
+                params, market, spot=float(spot), variance=0.001,
+                strike=float(strike), maturity=1/250,
+            )
+            assert result.price[i, j] == pytest.approx(ref.price, abs=2e-6)
+            assert result.delta[i, j] == pytest.approx(ref.delta, abs=2e-6)
+            assert result.gamma[i, j] == pytest.approx(ref.gamma, abs=2e-6)
+
+
+def test_far_otm_short_expiry_with_zero_variance_stays_nonnegative(market):
+    params = HestonParams(1.0, 0.04, 0.4, 0.7, 0.04)
+    result = heston_greeks_batch(
+        params, market, strike=104., maturity=2/250,
+        spots=np.array([84.890705]), variances=np.array([0.]),
+    )
+    assert 0 <= result.price[0] < 1e-6
+    assert 0 <= result.delta[0] < 1e-5
+    assert 0 <= result.gamma[0] < 1e-5

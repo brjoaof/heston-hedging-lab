@@ -227,85 +227,92 @@ def _adaptive_heston_greeks_near_boundary(
 
     The standard P1/P2 inversion subtracts two nearly equal large numbers and
     is unreliable for near-zero variance at one-day expiry. This formula
-    integrates the out-of-the-money call *directly*, including analytical
-    Delta, Gamma and dPrice/dv. QUADPACK's oscillatory integration handles
-    the high-frequency short-maturity phase without distorting the Heston
-    dynamics or silently replacing the price with intrinsic value.
+    integrates the out-of-the-money option directly, including analytical
+    Delta, Gamma and dPrice/dv. For in-the-money calls, calculate the OTM
+    put and recover the call through exact put-call parity. The original
+    direct-call integral can lose half its value at large Fourier cutoffs.
+    This avoids that cancellation without replacing the model with intrinsic
+    value or a volatility approximation.
 
     This is intentionally a rare-state fallback, not the main path pricer.
     """
-    import warnings
-    from scipy.integrate import IntegrationWarning, quad
+    from scipy.integrate import simpson
 
     r, q = market.risk_free_rate, market.dividend_yield
     kappa, theta, xi, rho = params.kappa, params.theta, params.xi, params.rho
     if xi <= 0:
         raise ValueError("Adaptive Fourier fallback requires xi>0")
-    # C = S exp(-qT) exp(-alpha*k)/pi * integral[...],
-    # k = log(K/F), alpha>0, F=S exp((r-q)T).
-    alpha = 1.0
+    # Carr-Madan works for calls with alpha>0 and puts with alpha<-1.
+    # Integrating the OTM side prevents Fourier cancellation in the ITM price.
+    # k = log(K/F), F=S exp((r-q)T).
     log_moneyness = math.log(strike/spot) - (r-q)*maturity
+    use_put = log_moneyness < 0.0
+    alpha = -2.0 if use_put else 1.0
     amplitude = math.exp(-alpha*log_moneyness) / math.pi
     discount_s = math.exp(-q*maturity)
 
-    def terms(u: float) -> tuple[complex, complex, complex, complex]:
-        z = complex(u, -(alpha + 1.0))
-        iz = 1j*z
-        b = kappa - rho*xi*iz
-        d = np.sqrt(b*b + xi*xi*(z*z+iz))
-        bmd = -xi*xi*(z*z+iz)/(b+d)
-        g = bmd/(b+d)
+    # Determine the spectral cutoff from the normalized Heston CF, not the
+    # Fourier oscillations. This is the same tail criterion as the reference
+    # adaptive method, but evaluate the integral on vectorized graded grids.
+    def vector_terms(u):
+        z = np.asarray(u) - 1j * (alpha + 1)
+        iz = 1j * z
+        b = kappa - rho * xi * iz
+        d = np.sqrt(b*b + xi*xi*(z*z + iz))
+        bmd = -xi*xi*(z*z + iz)/(b + d)
+        g = bmd/(b + d)
         e = np.exp(-d*maturity)
-        c = (kappa*theta/(xi*xi))*(
-            bmd*maturity - 2*(np.log1p(-g*e)-np.log1p(-g))
+        c = kappa*theta/(xi*xi) * (
+            bmd*maturity - 2*(np.log1p(-g*e) - np.log1p(-g))
         )
-        D = (bmd/(xi*xi))*(1-e)/(1-g*e)
-        cf = np.exp(c + D*variance)
-        denominator = alpha + 1j*u
-        return (cf/(denominator*(denominator+1)),
-                cf/denominator, cf, cf*D/(denominator*(denominator+1)))
+        D = bmd/(xi*xi) * (1-e)/(1-g*e)
+        return np.exp(c + D*variance), D
 
-    # At v=0 and short T the characteristic function decays only at very
-    # high frequencies. Instead of integrating to infinity (which can produce
-    # a convincing but wrong answer when k≈0), truncate at an explicit point
-    # where the *damped* characteristic function is numerically negligible.
     cutoff = 100.0
     for _ in range(25):
-        if abs(terms(cutoff)[2]) < 1e-12:
+        if abs(vector_terms(cutoff)[0]) < 1e-12:
             break
         cutoff *= 2
     else:
         raise FloatingPointError("Could not bound Heston Fourier integration tail")
 
-    integrals = []
-    for field in range(4):
-        value = 0.0
-        for imaginary in (False, True):
-            if imaginary and abs(log_moneyness) < 1e-15:
-                continue
+    # QUADPACK's single-interval oscillatory integration can alias over huge
+    # intervals (a valid 10.28 ITM call was reported as 5.14 at xi=.4).
+    # Composite Simpson on a fine low-frequency grid and a wider high-frequency
+    # grid prevents the alias while using optimized NumPy complex operations.
+    step = min(0.5, math.pi/(12*abs(log_moneyness))) if log_moneyness else 0.5
+    n_tail = math.ceil((cutoff - 100.0)/step)
+    if n_tail > 500_000:
+        raise FloatingPointError("Heston Fourier cutoff exceeds safe quadrature budget")
+    if n_tail % 2:
+        n_tail += 1
+    grids = (
+        np.linspace(0.0, 5.0, 501),
+        np.linspace(5.0, 100.0, 951),
+        np.linspace(100.0, cutoff, n_tail+1),
+    )
+    integrals = np.zeros(4)
+    for u in grids:
+        cf, D = vector_terms(u)
+        den = alpha + 1j*u
+        phase = np.exp(-1j*u*log_moneyness)*cf
+        factors = (
+            phase/(den*(den+1)), phase/den, phase,
+            phase*D/(den*(den+1)),
+        )
+        for j, factor in enumerate(factors):
+            integrals[j] += simpson(factor.real, x=u)
+    integrals *= math.exp(-alpha*log_moneyness)/math.pi
 
-            def component(u: float) -> float:
-                entry = terms(u)[field]
-                return float(entry.imag if imaginary else entry.real)
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", IntegrationWarning)
-                # QUADPACK's finite-interval oscillatory rule remains stable
-                # when |k| is small, unlike its infinite-cycle counterpart.
-                integral, _ = quad(
-                    component, 0, cutoff,
-                    weight="sin" if imaginary else "cos",
-                    wvar=log_moneyness, epsabs=1e-10, epsrel=1e-10,
-                    limit=700,
-                )
-            value += integral
-        integrals.append(value * amplitude)
-
-    call = spot * discount_s * integrals[0]
-    delta = discount_s * integrals[1]
+    otm_price = spot * discount_s * integrals[0]
+    otm_delta = discount_s * integrals[1]
+    # Put-call parity is exact under the Q dynamics with deterministic r, q.
+    parity = spot * discount_s - strike * math.exp(-r*maturity)
+    call = otm_price + parity if use_put else otm_price
+    delta = otm_delta + discount_s if use_put else otm_delta
     gamma = discount_s / spot * integrals[2]
     dvar = spot * discount_s * integrals[3]
-    lower = max(spot*discount_s - strike*math.exp(-r*maturity), 0.0)
+    lower = max(parity, 0.0)
     upper = spot*discount_s
     # Absolute tolerance is well below one cent per 100-unit underlying.
     # Any larger violation indicates a genuine numerical failure.
@@ -313,7 +320,7 @@ def _adaptive_heston_greeks_near_boundary(
             call < lower-1e-7 or call > upper+1e-7 or
             delta < -1e-7 or delta > discount_s+1e-7 or gamma < -1e-7):
         raise FloatingPointError(
-            f"Adaptive Heston Fourier unstable at S={spot:.8g}, v={variance:.8g}, "
+            f"Adaptive Heston Fourier unstable at xi={xi:.8g}, S={spot:.8g}, v={variance:.8g}, "
             f"K={strike:.8g}, T={maturity:.8g}; "
             f"price={call:.9g} gamma={gamma:.9g} delta={delta:.9g}"
         )
@@ -477,13 +484,27 @@ def heston_greeks_batch(
     # Near expiration, the standard P1/P2 representation may be inaccurate
     # without violating its coarse bounds (e.g. a small, spurious OTM delta).
     if params.xi > 0 and maturity <= 2/250 + 1e-12:
-        for i in np.flatnonzero(vv <= 1e-4):
+        for i in np.flatnonzero(vv <= 0.0005):
             accurate = _adaptive_heston_greeks_near_boundary(
                 params, market, spot=float(ss[i]), variance=float(vv[i]),
                 strike=strike, maturity=maturity,
             )
             prices[i], deltas[i] = accurate.price, accurate.delta
             gammas[i], dvars[i] = accurate.gamma, accurate.variance_sensitivity
+    # The 192-node inversion may have small but material Fourier aliasing
+    # around v~1e-3 at one-day expiry even when all crude bounds hold.
+    # Recompute those uncommon states with a higher-resolution *vectorized*
+    # quadrature; keep the expensive damped inversion for v<=5e-4 only.
+    if params.xi > 0 and n_quadrature < 2048 and maturity <= 2/250 + 1e-12:
+        middle = np.flatnonzero((vv > 0.0005) & (vv <= 0.0045))
+        if len(middle):
+            refined = heston_greeks_batch(
+                params, market, strike=strike, maturity=maturity,
+                spots=ss[middle], variances=vv[middle],
+                option_type="call", n_quadrature=2048,
+            )
+            prices[middle], deltas[middle] = refined.price, refined.delta
+            gammas[middle], dvars[middle] = refined.gamma, refined.variance_sensitivity
     gammas = np.maximum(gammas, 0)  # convexity; tiny negative Fourier noise
     if option_type == "put":
         prices -= ss * stock_discount - strike * strike_discount
@@ -617,7 +638,7 @@ def heston_greeks_strikes_batch(
         )
         # Even finite (and hence not flagged) short-expiry P1/P2 estimates
         # can contain spurious OTM prices/deltas near zero variance.
-        boundary = ((vv[start:stop] <= 1e-4) &
+        boundary = ((vv[start:stop] <= 0.0005) &
                     (maturity <= 2/250 + 1e-12))
         for j in range(n_strikes):
             for local_i in np.flatnonzero(boundary):
@@ -642,6 +663,19 @@ def heston_greeks_strikes_batch(
             gamma[indices,j] = refined.gamma
             dvar[indices,j] = refined.variance_sensitivity
 
+    # Same selective high-resolution recalculation for joint-strike pricing.
+    # This shares Heston CF terms over all strikes and is substantially faster
+    # than 3 independent damped inversions at every moderately small variance.
+    if params.xi > 0 and n_quadrature < 2048 and maturity <= 2/250 + 1e-12:
+        middle = np.flatnonzero((vv > 0.0005) & (vv <= 0.0045))
+        if len(middle):
+            refined = heston_greeks_strikes_batch(
+                params, market, strikes=ks, maturity=maturity,
+                spots=ss[middle], variances=vv[middle],
+                option_type="call", n_quadrature=2048,
+            )
+            price[middle], delta[middle] = refined.price, refined.delta
+            gamma[middle], dvar[middle] = refined.gamma, refined.variance_sensitivity
     gamma = np.maximum(gamma,0)
     if option_type == "put":
         price -= ss[:,None]*discount_s-ks[None,:]*discount_k
