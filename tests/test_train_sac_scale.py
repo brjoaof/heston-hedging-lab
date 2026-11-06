@@ -159,13 +159,15 @@ def test_json_round_trip_resume_plan_with_original_source_fingerprint():
     assert isinstance(requested['config']['expiries_days'], tuple)
     compat = json.loads((ROOT/'scale_resume_compat.json').read_text())
     assert compat['schema_version'] == 2
-    assert requested['code_sha256'] == compat['fixed_code_sha256']
+    # The older compatibility entries cover ONLY the historical source
+    # fingerprint. A new numerical pricing backend must fail closed on old
+    # SAC recovery snapshots: do not silently change an ongoing experiment.
     for previous in compat['compatible_previous_sha256']:
-        old['code_sha256'] = previous
-        assert_same_plan(old, requested)
-        assert code_version_compatible(previous, requested['code_sha256'])
+        assert code_version_compatible(previous, compat['fixed_code_sha256'])
+        assert not code_version_compatible(previous, requested['code_sha256'])
+    assert_same_plan(old, requested)  # tuples -> JSON arrays; source unchanged
     assert not code_version_compatible('f'*64, requested['code_sha256'])
-    assert not code_version_compatible(old['code_sha256'], '0'*64)
+    assert not code_version_compatible(compat['compatible_previous_sha256'][0], '0'*64)
 
 
 @pytest.mark.parametrize('field,new_value',[
@@ -177,7 +179,7 @@ def test_original_run_cannot_resume_with_changed_scientific_controls(field,new_v
     cfg = ForwardEnvConfig.from_mapping(_read_config(ROOT/'config.json')[0])
     req = scale_plan(make_args(),cfg=cfg,config_sha='cfg',val_sha='val')
     old = json.loads(json.dumps(req))
-    old['code_sha256'] = json.loads((ROOT/'scale_resume_compat.json').read_text())['compatible_previous_sha256'][0]
+    old['code_sha256'] = req['code_sha256']
     req[field] = new_value
     with pytest.raises(ValueError,match='Resume configuration mismatch'):
         assert_same_plan(old, req)
@@ -188,7 +190,7 @@ def test_legacy_resume_rejects_changed_financial_config_inner_field():
     cfg = ForwardEnvConfig.from_mapping(_read_config(ROOT/'config.json')[0])
     req = scale_plan(make_args(),cfg=cfg,config_sha='cfg',val_sha='val')
     old = json.loads(json.dumps(req))
-    old['code_sha256'] = json.loads((ROOT/'scale_resume_compat.json').read_text())['compatible_previous_sha256'][0]
+    old['code_sha256'] = req['code_sha256']
     req['config']['fixed_cost'] = 999
     with pytest.raises(ValueError,match='Resume configuration mismatch for config'):
         assert_same_plan(old,req)
@@ -263,7 +265,8 @@ def test_loading_checkpoint_requests_fresh_sb3_reset():
 def test_legacy_resume_manifest_includes_uploaded_checkpoint():
     from train_sac_scale import code_fingerprint
     compat = json.loads((ROOT/'scale_resume_compat.json').read_text())
-    assert compat['fixed_code_sha256'] == code_fingerprint()
+    assert compat['fixed_code_sha256'] != code_fingerprint()
+    assert not code_version_compatible(compat['compatible_previous_sha256'][0], code_fingerprint())
     assert '75ca78ee958d4f3326867c7cc59de1c87422dc6f267768c06e48bd0b25c8ce58' in compat['compatible_previous_sha256']
     assert 'ba32bff3d9ed80a47cb4afa7540c7811ead9a5ab0881262a3e9bd4ff358f89e8' in compat['compatible_previous_sha256']
 

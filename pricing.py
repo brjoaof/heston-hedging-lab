@@ -372,3 +372,146 @@ def heston_greeks_batch(
         gamma=gammas.reshape(outshape), variance_sensitivity=dvars.reshape(outshape),
         initial_volatility_vega=(2*np.sqrt(vv)*dvars).reshape(outshape),
     )
+
+
+def heston_greeks_strikes_batch(
+    params: HestonParams, market: MarketDynamics, *,
+    strikes: np.ndarray, maturity: float, spots: np.ndarray, variances: np.ndarray,
+    option_type: str = "call", n_quadrature: int = 192,
+) -> OptionGreeks:
+    """Joint price/Greeks for strikes sharing a Heston state and maturity.
+
+    This is mathematically the same Fourier quadrature as
+    ``heston_greeks_batch``, but its strike-independent characteristic-function
+    coefficients are calculated only once. Output shapes are (paths, strikes).
+    The legacy single-strike implementation remains the numerical reference
+    and the adaptive fallback for challenging states.
+    """
+    ks = np.asarray(strikes, dtype=float)
+    if ks.ndim != 1 or len(ks) == 0 or not np.all(np.isfinite(ks)) or np.any(ks <= 0):
+        raise ValueError("strikes must be a nonempty vector of positive finite values")
+    if market.measure != "Q":
+        raise ValueError("Risk-neutral (Q) dynamics required for valuation")
+    if not math.isfinite(maturity) or maturity <= 0:
+        raise ValueError("Require positive finite remaining maturity")
+    if option_type not in {"call", "put"}:
+        raise ValueError("option_type must be call or put")
+    if n_quadrature < 64:
+        raise ValueError("n_quadrature must be at least 64")
+    ss, vv = np.broadcast_arrays(np.asarray(spots, float), np.asarray(variances, float))
+    if ss.ndim != 1 or not np.all(np.isfinite(ss)) or np.any(ss <= 0) or not np.all(np.isfinite(vv)) or np.any(vv < 0):
+        raise ValueError("spots and variances must be positive finite 1-D arrays")
+    if params.xi == 0 or len(ks) == 1:
+        parts = [heston_greeks_batch(
+            params, market, strike=float(k), maturity=maturity,
+            spots=ss, variances=vv, option_type=option_type,
+            n_quadrature=n_quadrature,
+        ) for k in ks]
+        return OptionGreeks(**{
+            field: np.column_stack([getattr(part, field) for part in parts])
+            for field in OptionGreeks.__dataclass_fields__
+        })
+
+    size, n_strikes = len(ss), len(ks)
+    price = np.empty((size, n_strikes), dtype=float)
+    delta = np.empty_like(price)
+    gamma = np.empty_like(price)
+    dvar = np.empty_like(price)
+    r, q = market.risk_free_rate, market.dividend_yield
+    discount_s = math.exp(-q*maturity)
+    discount_k = math.exp(-r*maturity)
+    kappa, theta, xi, rho = params.kappa, params.theta, params.xi, params.rho
+    x, w = _legendre_nodes(n_quadrature)
+    z = (x + 1)/2
+    w = w/2
+    integrated_v = theta*maturity + (vv-theta)*(-math.expm1(-kappa*maturity))/kappa
+    scale = 2/np.sqrt(np.maximum(integrated_v, 1e-6))
+    log_forward_m = np.log(ss[:,None]/ks[None,:]) + (r-q)*maturity
+    deep = (maturity <= .10) & (
+        np.abs(log_forward_m) >= np.maximum(.12, 10*np.sqrt(np.maximum(integrated_v[:,None], 0)))
+    )
+    log_ks = np.log(ks)[None,None,:]
+
+    for start in range(0, size, 256):
+        stop = min(start+256, size)
+        s = ss[start:stop,None]
+        v = vv[start:stop,None]
+        u = scale[start:stop,None]*z/(1-z)
+        weights = scale[start:stop,None]*w/(1-z)**2
+
+        def common_terms(shifted: bool):
+            zz = u-1j if shifted else u
+            iu = 1j*zz
+            b = kappa-rho*xi*iu
+            d = np.sqrt(b*b + xi*xi*(zz*zz+iu))
+            bmd = -xi*xi*(zz*zz+iu)/(b+d)
+            g = bmd/(b+d)
+            e = np.exp(-d*maturity)
+            c = (kappa*theta/xi**2)*(
+                bmd*maturity - 2*(np.log1p(-g*e)-np.log1p(-g))
+            )
+            D = (bmd/xi**2)*(1-e)/(1-g*e)
+            base_phase = np.exp(1j*u*(np.log(s)+(r-q)*maturity) + c + D*v)
+            return base_phase, D
+
+        base1,D1 = common_terms(True)
+        base2,D2 = common_terms(False)
+        strike_factor = np.exp(-1j*u[:,:,None]*log_ks)
+        phase1 = base1[:,:,None]*strike_factor
+        phase2 = base2[:,:,None]*strike_factor
+        inv_iu = 1/(1j*u[:,:,None])
+        ww = weights[:,:,None]
+        P1 = .5 + np.sum(ww*(phase1*inv_iu).real, axis=1)/math.pi
+        P2 = .5 + np.sum(ww*(phase2*inv_iu).real, axis=1)/math.pi
+        price[start:stop] = s*discount_s*P1 - ks[None,:]*discount_k*P2
+        delta[start:stop] = discount_s*P1
+        gamma[start:stop] = discount_s/s * np.sum(ww*phase1.real,axis=1)/math.pi
+        dvar[start:stop] = (
+            s*discount_s*np.sum(ww*(phase1*D1[:,:,None]*inv_iu).real,axis=1)
+            - ks[None,:]*discount_k*np.sum(ww*(phase2*D2[:,:,None]*inv_iu).real,axis=1)
+        )/math.pi
+
+        deep_local = deep[start:stop]
+        if np.any(deep_local):
+            intrinsic = np.maximum(s*discount_s - ks[None,:]*discount_k, 0)
+            price[start:stop] = np.where(deep_local, intrinsic, price[start:stop])
+            delta[start:stop] = np.where(deep_local, np.where(log_forward_m[start:stop]>0, discount_s,0), delta[start:stop])
+            gamma[start:stop] = np.where(deep_local, 0, gamma[start:stop])
+            dvar[start:stop] = np.where(deep_local, 0, dvar[start:stop])
+
+        lower = np.maximum(s*discount_s-ks[None,:]*discount_k, 0)
+        upper = s*discount_s
+        bad = (
+            ~np.isfinite(price[start:stop]) |
+            (price[start:stop] < lower-1e-4) |
+            (price[start:stop] > upper+1e-4) |
+            (delta[start:stop] < -1e-3) |
+            (delta[start:stop] > discount_s+1e-3) |
+            (gamma[start:stop] < -1e-3)
+        )
+        for j in range(n_strikes):
+            indices = np.flatnonzero(bad[:,j])+start
+            if not len(indices):
+                continue
+            refined = heston_greeks_batch(
+                params, market, strike=float(ks[j]), maturity=maturity,
+                spots=ss[indices], variances=vv[indices], option_type="call",
+                n_quadrature=1024 if n_quadrature<1024 else 2048,
+            )
+            price[indices,j] = refined.price
+            delta[indices,j] = refined.delta
+            gamma[indices,j] = refined.gamma
+            dvar[indices,j] = refined.variance_sensitivity
+
+    gamma = np.maximum(gamma,0)
+    if option_type == "put":
+        price -= ss[:,None]*discount_s-ks[None,:]*discount_k
+        delta -= discount_s
+    if np.any(~np.isfinite(price)) or np.any(~np.isfinite(delta)) or np.any(price < -1e-4):
+        raise FloatingPointError("Unstable batched Heston path valuation")
+    price = np.maximum(price,0)
+    return OptionGreeks(
+        price=price, delta=delta, gamma=gamma,
+        variance_sensitivity=dvar,
+        initial_volatility_vega=2*np.sqrt(vv[:,None])*dvar,
+    )

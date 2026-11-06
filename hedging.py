@@ -12,7 +12,7 @@ import numpy as np
 
 from heston import HestonParams, HestonPaths, MarketDynamics
 from portfolio import OptionBook, expiry_cashflows
-from pricing import heston_greeks_batch
+from pricing import heston_greeks_batch, heston_greeks_strikes_batch
 
 
 @dataclass(frozen=True)
@@ -50,23 +50,30 @@ def value_book_paths(
     bucket_delta = (np.zeros((*paths.spot.shape, len(maturities)), dtype=float)
                     if include_bucket_deltas else None)
     maturity_index = {m: i for i, m in enumerate(maturities)}
+    # Group contracts with the same maturity and option type. Their Fourier
+    # characteristic-function terms are identical except for the strike phase.
+    groups: dict[tuple[int, str], list[tuple[int, object]]] = {}
     for contract_index, contract in enumerate(book.contracts):
         if contract.maturity_days >= n_days:
             raise ValueError("Option matures after the simulated horizon")
-        amount = contract.quantity * contract.multiplier
-        for day in range(contract.maturity_days):
-            remaining = (contract.maturity_days - day) / trading_days_per_year
-            greeks = heston_greeks_batch(
-                params_q, market_q, strike=contract.strike, maturity=remaining,
-                spots=paths.spot[:, day], variances=paths.variance[:, day],
-                option_type=contract.option_type,
+        groups.setdefault((contract.maturity_days, contract.option_type), []).append((contract_index, contract))
+    for (maturity_days, option_type), contracts in groups.items():
+        strikes = np.asarray([contract.strike for _, contract in contracts], dtype=float)
+        for day in range(maturity_days):
+            remaining = (maturity_days-day)/trading_days_per_year
+            greeks = heston_greeks_strikes_batch(
+                params_q, market_q, strikes=strikes, maturity=remaining,
+                spots=paths.spot[:,day], variances=paths.variance[:,day],
+                option_type=option_type,
             )
-            if contract_prices is not None:
-                contract_prices[:, day, contract_index] = greeks.price
-            if bucket_delta is not None:
-                bucket_delta[:, day, maturity_index[contract.maturity_days]] += amount * greeks.delta
-            for target, field in zip(values, ("price", "delta", "gamma", "variance_sensitivity")):
-                target[:, day] += amount * getattr(greeks, field)
+            for j, (contract_index, contract) in enumerate(contracts):
+                amount = contract.quantity*contract.multiplier
+                if contract_prices is not None:
+                    contract_prices[:,day,contract_index] = greeks.price[:,j]
+                if bucket_delta is not None:
+                    bucket_delta[:,day,maturity_index[maturity_days]] += amount*greeks.delta[:,j]
+                for target, field in zip(values,("price","delta","gamma","variance_sensitivity")):
+                    target[:,day] += amount*getattr(greeks,field)[:,j]
     return BookPaths(*values, settlements, contract_prices, bucket_delta)
 
 
