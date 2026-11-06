@@ -2,15 +2,32 @@
   "schema_version": 1,
   "description": "Regimes especialistas para supervised operator learning; regimes reservados ficam fora do treino do operador.",
   "base_config": "config.json",
-  "data_root": "results/forward_experiments/scale_regimes",
+  "data_root": "results/forward_experiments/scale_regimes_heston_v0p04_theta0p04_rho_pos0p7",
   "regimes": [
-    "0.00", "0.05", "0.10", "0.15", "0.20",
-    "0.25", "0.30", "0.35", "0.40"
+    "0.00",
+    "0.05",
+    "0.10",
+    "0.15",
+    "0.20",
+    "0.25",
+    "0.30",
+    "0.35",
+    "0.40"
   ],
   "reserved_operator_regimes": [],
-  "seeds": [1],
-  "split_sizes": {"train": 64, "validation": 5000, "test": 20000},
-  "split_seeds": {"train": 1101, "validation": 2202, "test": 3303},
+  "seeds": [
+    1
+  ],
+  "split_sizes": {
+    "train": 64,
+    "validation": 5000,
+    "test": 20000
+  },
+  "split_seeds": {
+    "train": 1101,
+    "validation": 2202,
+    "test": 3303
+  },
   "train": {
     "timesteps": 50000000,
     "n_envs": 30,

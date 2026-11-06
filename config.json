@@ -109,10 +109,10 @@
     "seed": 123,
     "heston": {
       "kappa": 1.0,
-      "theta": 0.2,
+      "theta": 0.04,
       "xi": 0.2,
       "rho": 0.7,
-      "v0": 0.2
+      "v0": 0.04
     },
     "expiries_days": [
       42,
