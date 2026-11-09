@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "Regimes especialistas para supervised operator learning; regimes reservados ficam fora do treino do operador.",
+  "base_config": "configs/heston_cos_campaign.json",
+  "data_root": "results/forward_experiments/scale_regimes_heston_cos_N512_L24",
+  "regimes": [
+    "0.00",
+    "0.05",
+    "0.10",
+    "0.15",
+    "0.20",
+    "0.25",
+    "0.30",
+    "0.35",
+    "0.40"
+  ],
+  "reserved_operator_regimes": [],
+  "seeds": [
+    1
+  ],
+  "split_sizes": {
+    "train": 64,
+    "validation": 5000,
+    "test": 20000
+  },
+  "split_seeds": {
+    "train": 1101,
+    "validation": 2202,
+    "test": 3303
+  },
+  "train": {
+    "timesteps": 50000000,
+    "n_envs": 30,
+    "vec_env": "subproc",
+    "train_chunk_paths": 16,
+    "eval_every": 2500000,
+    "resume_every": 500000,
+    "progress_every": 50000,
+    "learning_starts": 50000,
+    "buffer_size": 500000,
+    "batch_size": 256,
+    "gamma": 0.995,
+    "tau": 0.002,
+    "learning_rate": 0.0001,
+    "penalty": 2.0,
+    "max_trade_increment": 1.0,
+    "max_band_width": 1.5,
+    "train_seed_base": 551177
+  },
+  "result_root": "results/cos_experts"
+}
