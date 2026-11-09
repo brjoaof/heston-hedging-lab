@@ -2,7 +2,7 @@
   "schema_version": 1,
   "description": "Regimes especialistas para supervised operator learning; regimes reservados ficam fora do treino do operador.",
   "base_config": "config.json",
-  "data_root": "results/forward_experiments/scale_regimes_heston_v0p04_theta0p04_rho_pos0p7",
+  "data_root": "results/forward_experiments/scale_regimes_heston_v0p04_theta0p04_rho_pos0p7_fourier_v3",
   "regimes": [
     "0.00",
     "0.05",
