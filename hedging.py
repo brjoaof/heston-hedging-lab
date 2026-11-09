@@ -15,6 +15,26 @@ from portfolio import OptionBook, expiry_cashflows
 from pricing import heston_greeks_batch, heston_greeks_strikes_batch
 
 
+def _pricing_backend(*, method: str, cos_n_terms: int, cos_L: float):
+    """Pick one pricing oracle for *all* marks and initial hedge deltas.
+
+    Fourier remains the historical default; COS is opt-in. No implicit
+    cross-method fallback is allowed, so datasets cannot silently mix them.
+    """
+    if method == "fourier":
+        return heston_greeks_strikes_batch, {}
+    if method == "cos":
+        from pricing_cos import heston_cos_greeks_strikes_batch
+        if type(cos_n_terms) is not int or cos_n_terms < 16:
+            raise ValueError("cos_n_terms must be an integer >= 16")
+        if not math.isfinite(cos_L) or cos_L <= 0:
+            raise ValueError("cos_L must be positive and finite")
+        return heston_cos_greeks_strikes_batch, {
+            "n_terms": cos_n_terms, "L": cos_L,
+        }
+    raise ValueError("pricing method must be 'fourier' or 'cos'")
+
+
 @dataclass(frozen=True)
 class BookPaths:
     value: np.ndarray
@@ -31,6 +51,7 @@ def value_book_paths(
     market_q: MarketDynamics, *, trading_days_per_year: int = 252,
     include_contract_prices: bool = False,
     include_bucket_deltas: bool = False,
+    pricing_method: str = "fourier", cos_n_terms: int = 512, cos_L: float = 24.0,
 ) -> BookPaths:
     """Revalue each *live* option on physical or Q paths, always using Q prices.
 
@@ -41,6 +62,9 @@ def value_book_paths(
         raise ValueError("Option valuation requires Q market parameters")
     if trading_days_per_year <= 0:
         raise ValueError("Invalid trading_days_per_year")
+    pricing_fn, pricing_kwargs = _pricing_backend(
+        method=pricing_method, cos_n_terms=cos_n_terms, cos_L=cos_L,
+    )
     values = [np.zeros_like(paths.spot) for _ in range(4)]
     settlements = expiry_cashflows(book, paths.spot)
     n_days = paths.spot.shape[1]
@@ -61,10 +85,10 @@ def value_book_paths(
         strikes = np.asarray([contract.strike for _, contract in contracts], dtype=float)
         for day in range(maturity_days):
             remaining = (maturity_days-day)/trading_days_per_year
-            greeks = heston_greeks_strikes_batch(
+            greeks = pricing_fn(
                 params_q, market_q, strikes=strikes, maturity=remaining,
                 spots=paths.spot[:,day], variances=paths.variance[:,day],
-                option_type=option_type,
+                option_type=option_type, **pricing_kwargs,
             )
             for j, (contract_index, contract) in enumerate(contracts):
                 amount = contract.quantity*contract.multiplier
@@ -220,6 +244,7 @@ def initial_forward_positions(
     book: OptionBook, paths: HestonPaths, params_q: HestonParams,
     market_q: MarketDynamics, *, expiries_days: tuple[int, ...] = (42, 84, 126),
     trading_days_per_year: int = 250, max_position: float = 3.0,
+    pricing_method: str = "fourier", cos_n_terms: int = 512, cos_L: float = 24.0,
 ) -> np.ndarray:
     """Delta-neutral initial forward holdings, clipped to [0, max_position].
 
@@ -231,18 +256,27 @@ def initial_forward_positions(
         raise ValueError("Initial forward hedge requires Q dynamics")
     if not math.isfinite(max_position) or max_position <= 0:
         raise ValueError("max_position must be positive")
+    pricing_fn, pricing_kwargs = _pricing_backend(
+        method=pricing_method, cos_n_terms=cos_n_terms, cos_L=cos_L,
+    )
     buckets = {m: i for i, m in enumerate(expiries_days)}
     delta = np.zeros((len(paths.spot), len(expiries_days)), dtype=float)
-    for c in book.contracts:
-        if c.maturity_days not in buckets:
+    # Group by expiry/type to share characteristic-function terms across strikes.
+    groups: dict[tuple[int, str], list[object]] = {}
+    for contract in book.contracts:
+        if contract.maturity_days not in buckets:
             raise ValueError("option maturity not covered by forward instruments")
-        g = heston_greeks_batch(
-            params_q, market_q, strike=c.strike,
-            maturity=c.maturity_days / trading_days_per_year,
+        groups.setdefault((contract.maturity_days, contract.option_type), []).append(contract)
+    for (maturity_days, option_type), contracts in groups.items():
+        strikes = np.array([c.strike for c in contracts], dtype=float)
+        g = pricing_fn(
+            params_q, market_q, strikes=strikes,
+            maturity=maturity_days / trading_days_per_year,
             spots=paths.spot[:, 0], variances=paths.variance[:, 0],
-            option_type=c.option_type,
+            option_type=option_type, **pricing_kwargs,
         )
-        delta[:, buckets[c.maturity_days]] += c.quantity * c.multiplier * g.delta
+        for j, c in enumerate(contracts):
+            delta[:, buckets[maturity_days]] += c.quantity * c.multiplier * g.delta[:, j]
     dforward_dspot = np.exp(
         (market_q.risk_free_rate - market_q.dividend_yield)
         * np.asarray(expiries_days)[None, :] / trading_days_per_year

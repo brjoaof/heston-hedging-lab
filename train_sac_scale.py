@@ -47,7 +47,7 @@ SELECTION_METRIC = "validation_q95_loss"
 SCHEMA_VERSION = 1
 SOURCE_FILES = (
     "train_sac_scale.py", "train_sac_trade.py", "rl_env.py", "band_policy.py",
-    "hedging.py", "forward_experiments.py", "heston.py", "pricing.py",
+    "hedging.py", "forward_experiments.py", "heston.py", "pricing.py", "pricing_cos.py",
     "volatility.py", "portfolio.py", "simulate.py",
 )
 

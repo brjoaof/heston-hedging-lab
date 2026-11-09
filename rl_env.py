@@ -113,6 +113,27 @@ def prepare_forward_episodes(
         raise ValueError("fixed ENIAC book requires expiries 42/84/126")
     if int(cfg["n_steps"]) != spec.expiries_days[-1]:
         raise ValueError("fixed ENIAC book requires horizon through last expiry")
+    # Explicitly select the valuation method; the same choice must price all
+    # contract marks and construct the initial forward positions. This block
+    # is included in the frozen forward_experiment config SHA.
+    pricing = cfg.get("pricing", {"method": "fourier"})
+    if not isinstance(pricing, dict) or not isinstance(pricing.get("method"), str):
+        raise ValueError("forward_experiment.pricing must contain a method")
+    if set(pricing) - {"method", "n_terms", "L"}:
+        raise ValueError("Unrecognized forward_experiment.pricing setting")
+    method = pricing["method"]
+    if method not in ("fourier", "cos"):
+        raise ValueError("Pricing method must be 'fourier' or 'cos'")
+    if method == "fourier" and ("n_terms" in pricing or "L" in pricing):
+        raise ValueError("COS parameters are not applicable to Fourier pricing")
+    n_terms = pricing.get("n_terms", 512)
+    L = pricing.get("L", 24.0)
+    if method == "cos":
+        if type(n_terms) is not int or n_terms < 16:
+            raise ValueError("COS n_terms must be an integer >= 16")
+        if isinstance(L, bool) or not isinstance(L, (int, float)) or not math.isfinite(L) or L <= 0:
+            raise ValueError("COS L must be positive and finite")
+    pricing_kwargs = dict(pricing_method=method, cos_n_terms=n_terms, cos_L=L)
     paths = simulate_heston(
         params, market, n_paths=n_paths, n_steps=int(cfg["n_steps"]),
         trading_days_per_year=spec.trading_days_per_year,
@@ -124,11 +145,13 @@ def prepare_forward_episodes(
         trading_days_per_year=spec.trading_days_per_year,
         include_contract_prices=True,
         include_bucket_deltas=True,
+        **pricing_kwargs,
     )
     initial = initial_forward_positions(
         book, paths, params, market, expiries_days=spec.expiries_days,
         trading_days_per_year=spec.trading_days_per_year,
         max_position=spec.max_position,
+        **pricing_kwargs,
     )
     return ForwardEpisodePool(paths, marks, initial, market), spec
 

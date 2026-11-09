@@ -80,6 +80,11 @@ def load_schedule(path: Path) -> dict[str, Any]:
     for x in ("base_config", "data_root"):
         if not isinstance(schedule[x], str) or not schedule[x]:
             raise ValueError(f"Missing {x}")
+    if "result_root" in schedule:
+        path = _full_path(schedule["result_root"])
+        expected_parent = (ROOT / "results").resolve()
+        if not path.is_relative_to(expected_parent) or path == expected_parent:
+            raise ValueError("result_root must be inside results/ and not equal to it")
     return schedule
 
 
@@ -102,7 +107,8 @@ def train_seed(schedule: dict, xi: str, seed: int) -> int:
 def result_dir(schedule: dict, mode: str, xi: str, seed: int) -> Path:
     t = schedule["train"]["timesteps"]
     budget = f"{t // 1_000_000}M" if t % 1_000_000 == 0 else str(t)
-    return ROOT / "results" / f"sac_{mode}" / f"{_xi(xi)[1]}_seed{seed}_{budget}"
+    root = _full_path(schedule["result_root"]) if "result_root" in schedule else ROOT / "results"
+    return root / f"sac_{mode}" / f"{_xi(xi)[1]}_seed{seed}_{budget}"
 
 
 def _run_matches(run: dict, schedule: dict, mode: str, xi: str, seed: int,
@@ -243,7 +249,8 @@ def _queue_lock(mode: str) -> Iterator[None]:
 def _execute_job(schedule: dict, mode: str, xi: str, seed: int, resume: bool) -> None:
     cmd = _train_command(schedule, mode, xi, seed, resume=resume)
     label = f"{_xi(xi)[1]}_seed{seed}"
-    log_dir = ROOT / "results" / "queue_logs" / mode
+    log_root = _full_path(schedule["result_root"]) if "result_root" in schedule else ROOT / "results"
+    log_dir = log_root / "queue_logs" / mode
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{label}.log"
     print(f"[queue] {mode} {label}: running; log={log_file}", flush=True)
